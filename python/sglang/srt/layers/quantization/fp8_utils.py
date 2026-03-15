@@ -407,54 +407,77 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     # TRTLLM uses the existing SGLang column-major scale layout.
-    # CUTLASS with scale_major_mode="MN" expects (k//block_k, m), so we normalize below.
     q_input, x_scale = sglang_per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=(backend == "trtllm")
     )
-    if backend == "cutlass":
-        block_n, block_k = block_size
-        m, k = input_2d.shape
-        n = weight.shape[0]
-        expected_x_scale_shape = (k // block_k, m)
-        expected_weight_scale_shape = (k // block_k, n // block_n)
-        if x_scale.shape == (m, k // block_k):
-            x_scale = x_scale.transpose(-1, -2).contiguous()
-        if weight_scale.shape == (n // block_n, k // block_k):
-            weight_scale = weight_scale.transpose(-1, -2).contiguous()
-        assert x_scale.shape == expected_x_scale_shape, (
-            "FlashInfer CUTLASS groupwise FP8 expects A scale layout "
-            f"(k//block_k, m) for scale_major_mode='MN', got {tuple(x_scale.shape)}; "
-            f"expected {expected_x_scale_shape}. "
-            f"strides={x_scale.stride()} is_contiguous={x_scale.is_contiguous()} "
-            f"m={m} n={n} k={k} block_size={block_size}"
+    if backend == "trtllm":
+        output = gemm_fp8_nt_groupwise(
+            q_input, weight, x_scale, weight_scale, out_dtype=input_2d.dtype
         )
-        assert weight_scale.shape == expected_weight_scale_shape, (
-            "FlashInfer CUTLASS groupwise FP8 expects B scale layout "
-            f"(k//block_k, n//block_n) for scale_major_mode='MN', got {tuple(weight_scale.shape)}; "
-            f"expected {expected_weight_scale_shape}. "
-            f"strides={weight_scale.stride()} is_contiguous={weight_scale.is_contiguous()} "
-            f"m={m} n={n} k={k} block_size={block_size}"
-        )
-        assert x_scale.dtype == torch.float32, (
-            "FlashInfer CUTLASS groupwise FP8 expects x_scale dtype float32, "
-            f"got {x_scale.dtype}."
-        )
-        assert weight_scale.dtype == torch.float32, (
-            "FlashInfer CUTLASS groupwise FP8 expects weight_scale dtype float32, "
-            f"got {weight_scale.dtype}."
-        )
-    # TRTLLM path continues using the original quantized scale layout.
-    output = gemm_fp8_nt_groupwise(
-        q_input,
-        weight,
-        x_scale,
-        weight_scale,
-        out_dtype=input_2d.dtype,
+        if bias is not None:
+            output += bias
+        return output.to(dtype=input_2d.dtype).view(*output_shape)
+
+    # CUTLASS path only from here on.
+    block_n, block_k = block_size
+    m, k = input_2d.shape
+    n = weight.shape[0]
+
+    # Normalise scale layouts to what the CUTLASS MN-major kernel expects.
+    # The quantizer stores weight_scale as (ceil_div(n,block_n), ceil_div(k,block_k));
+    # the kernel wants (ceil_div(k,block_k), ceil_div(n,block_n)).
+    # sglang_per_token_group_quant_fp8 produces x_scale as (m, ceil_div(k,block_k));
+    # the kernel wants (ceil_div(k,block_k), m).
+    # ceil_div is required (not //) because n or k may not be block-size multiples
+    if x_scale.shape == (m, ceil_div(k, block_k)):
+        x_scale = x_scale.transpose(-1, -2).contiguous()
+    if weight_scale.shape == (ceil_div(n, block_n), ceil_div(k, block_k)):
+        weight_scale = weight_scale.transpose(-1, -2).contiguous()
+
+    expected_x_scale_shape = (ceil_div(k, block_k), m)
+    expected_weight_scale_shape = (ceil_div(k, block_k), ceil_div(n, block_n))
+
+    assert x_scale.shape == expected_x_scale_shape, (
+        "FlashInfer CUTLASS groupwise FP8 expects A scale layout "
+        f"(ceil_div(k,block_k), m) for scale_major_mode='MN', got {tuple(x_scale.shape)}; "
+        f"expected {expected_x_scale_shape}. "
+        f"strides={x_scale.stride()} is_contiguous={x_scale.is_contiguous()} "
+        f"m={m} n={n} k={k} block_size={block_size}"
+    )
+    assert weight_scale.shape == expected_weight_scale_shape, (
+        "FlashInfer CUTLASS groupwise FP8 expects B scale layout "
+        f"(ceil_div(k,block_k), ceil_div(n,block_n)) for scale_major_mode='MN', "
+        f"got {tuple(weight_scale.shape)}; expected {expected_weight_scale_shape}. "
+        f"strides={weight_scale.stride()} is_contiguous={weight_scale.is_contiguous()} "
+        f"m={m} n={n} k={k} block_size={block_size}"
+    )
+    assert x_scale.dtype == torch.float32, (
+        f"FlashInfer CUTLASS groupwise FP8 expects x_scale dtype float32, got {x_scale.dtype}."
+    )
+    assert weight_scale.dtype == torch.float32, (
+        f"FlashInfer CUTLASS groupwise FP8 expects weight_scale dtype float32, got {weight_scale.dtype}."
     )
 
+    # Pre-pad weight to the next block_n boundary to work around a bug in FlashInfer's
+    # SM120 groupwise wrapper (gemm_base.py): it infers n_dim by transposing the
+    # row-major (n, k) weight to (k, n) and reading shape[0], which gives k instead of
+    # n.  With swapped dimensions its internal padding/slicing corrupts the call
+    # geometry, producing silently wrong output.  By ensuring n is already aligned we
+    # prevent the wrapper from entering that path.  FP8 zero-padding is
+    # accumulator-neutral, and the scale already has ceil_div(n, block_n) tiles covering
+    # the partial trailing block, so no scale padding is needed.
+    n_padded = ceil_div(n, block_n) * block_n
+    needs_pad = n_padded != n
+    if needs_pad:
+        weight = torch.nn.functional.pad(weight, (0, 0, 0, n_padded - n))
+
+    output = gemm_fp8_nt_groupwise(
+        q_input, weight, x_scale, weight_scale, out_dtype=input_2d.dtype
+    )
     if bias is not None:
         output += bias
-
+    if needs_pad:
+        output = output[:, :n].contiguous()
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
